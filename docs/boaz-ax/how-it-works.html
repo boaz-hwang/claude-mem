@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>claude-mem 동작 원리 — BOAZ AX History 계층 준비</title>
+<style>
+  :root{--bg:#fafaf7;--fg:#1d1d1b;--mut:#6b6b66;--line:#deddd6;--card:#fff;--acc:#2f5bd3;--acc2:#0f8a6a;--warn:#c2410c;--soft:#eef2fd;--soft2:#e8f6f1;--soft3:#fdf0e8}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.65 "IBM Plex Sans KR","Pretendard",-apple-system,sans-serif}
+  main{max-width:1080px;margin:0 auto;padding:48px 28px 96px}
+  h1{font-size:30px;margin:0 0 6px;letter-spacing:-.02em}
+  h2{font-size:21px;margin:56px 0 14px;padding-top:18px;border-top:1px solid var(--line);letter-spacing:-.01em}
+  h3{font-size:16px;margin:22px 0 8px}
+  .sub{color:var(--mut);margin:0 0 22px}
+  .tldr{background:var(--card);border:1px solid var(--line);border-left:4px solid var(--acc);border-radius:10px;padding:18px 22px}
+  .tldr ol{margin:6px 0 0;padding-left:20px}
+  code{font:13px "JetBrains Mono",ui-monospace,monospace;background:#f0efe9;padding:1px 5px;border-radius:4px}
+  .ref{font:12px ui-monospace,monospace;color:var(--mut)}
+  table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line);border-radius:10px;overflow:hidden;font-size:14px}
+  th,td{padding:9px 12px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+  th{background:#f3f2ec;font-weight:600}
+  tr:last-child td{border-bottom:none}
+  .pill{display:inline-block;font-size:12px;padding:1px 8px;border-radius:99px;font-weight:600}
+  .ok{background:var(--soft2);color:var(--acc2)} .gap{background:var(--soft3);color:var(--warn)} .part{background:var(--soft);color:var(--acc)}
+  /* pipeline */
+  .pipe{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin:18px 0 8px}
+  .stage{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px;position:relative;opacity:0;transform:translateY(10px);animation:in .5s forwards}
+  .stage:nth-child(1){animation-delay:.05s}.stage:nth-child(2){animation-delay:.25s}.stage:nth-child(3){animation-delay:.45s}.stage:nth-child(4){animation-delay:.65s}.stage:nth-child(5){animation-delay:.85s}
+  @keyframes in{to{opacity:1;transform:none}}
+  .stage:not(:last-child)::after{content:"→";position:absolute;right:-10px;top:42%;color:var(--acc);font-weight:700;background:var(--bg);padding:0 1px}
+  .stage .n{font:700 12px ui-monospace,monospace;color:var(--acc)}
+  .stage b{display:block;margin:2px 0 6px}
+  .stage p{margin:0;font-size:13px;color:var(--mut)}
+  .loop{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .box{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
+  .box h3{margin-top:0}
+  .flow{display:flex;flex-direction:column;gap:6px;margin:0;padding:0;list-style:none;counter-reset:s}
+  .flow li{counter-increment:s;padding-left:30px;position:relative;font-size:14px}
+  .flow li::before{content:counter(s);position:absolute;left:0;top:1px;width:20px;height:20px;border-radius:50%;background:var(--acc);color:#fff;font:700 11px/20px ui-monospace,monospace;text-align:center}
+  .warnbox{background:var(--soft3);border:1px solid #f3cdb3;border-radius:10px;padding:12px 16px;font-size:14px}
+  /* timeline swimlane */
+  .lanes{display:grid;grid-template-columns:150px 1fr;border:1px solid var(--line);border-radius:12px;overflow:hidden;background:var(--card)}
+  .lanes>div{padding:10px 12px;border-bottom:1px solid var(--line);font-size:13px}
+  .lanes .lh{background:#f3f2ec;font-weight:600}
+  .ev{display:inline-block;margin:2px 4px 2px 0;padding:3px 9px;border-radius:7px;background:var(--soft);font:12px ui-monospace,monospace}
+  .ev.a{background:var(--soft2)}
+  footer{margin-top:60px;color:var(--mut);font-size:13px}
+  @media (max-width:820px){.pipe{grid-template-columns:1fr}.stage::after{display:none}.loop{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<main>
+<h1>claude-mem 동작 원리</h1>
+<p class="sub">포크 <code>boaz-hwang/claude-mem</code> · 기준 커밋 <code>a046a6a9f</code>(upstream v16.1.x) · 2026-11-24 코드 조사 · 경로는 저장소 루트 기준. 근거를 직접 읽지 못한 항목은 (추정)으로 표시했습니다.</p>
+
+<div class="tldr">
+<b>한 줄 요약:</b> Claude Code 훅이 세션 중 일어난 일을 로컬 worker에 넘기면, worker가 Haiku로 <b>압축한 관찰(observation)</b>을 만들어 SQLite·FTS5·Chroma에 저장합니다. 다음 세션이 시작될 때 같은 프로젝트의 최근 관찰 50개를 맥락으로 넣어 줍니다.
+<ol>
+<li><b>수집</b> — 도구를 쓸 때마다 PostToolUse 훅이 이벤트를 spool 파일에 쌓습니다.</li>
+<li><b>압축</b> — worker가 Claude Agent SDK <code>query()</code>로 관찰을 생성하고, Stop 때 세션 요약을 만듭니다.</li>
+<li><b>저장·색인</b> — <code>~/.claude-mem/claude-mem.db</code>(SQLite WAL) + FTS5 + Chroma(벡터)에 저장합니다.</li>
+<li><b>주입</b> — SessionStart 훅이 같은 프로젝트의 최근 관찰과 요약을 타임라인으로 렌더링해 넣습니다.</li>
+<li><b>검색</b> — MCP 도구 <code>search → timeline → get_observations</code>가 worker HTTP API를 호출합니다.</li>
+</ol>
+</div>
+
+<h2>1. 전체 파이프라인</h2>
+<div class="pipe">
+  <div class="stage"><span class="n">01 HOOK</span><b>Claude Code 훅</b><p>11개 이벤트에 <code>claude-mem hook …</code> 명령을 등록합니다.</p><div class="ref">plugin/hooks/hooks.json</div></div>
+  <div class="stage"><span class="n">02 SPOOL</span><b>Hook spool</b><p>훅은 빨리 끝나도록 이벤트를 파일에 쓰고 바로 종료합니다.</p><div class="ref">src/shared/hook-spool.ts:238</div></div>
+  <div class="stage"><span class="n">03 WORKER</span><b>로컬 worker (bun)</b><p>127.0.0.1의 HTTP 서버입니다. drain이 spool을 읽어 큐에 넣습니다.</p><div class="ref">src/services/worker/hook-spool-drain.ts</div></div>
+  <div class="stage"><span class="n">04 AI</span><b>관찰 생성</b><p>Agent SDK <code>query()</code>로 도구 입출력을 구조화된 관찰로 압축합니다.</p><div class="ref">src/services/worker/ClaudeProvider.ts:537</div></div>
+  <div class="stage"><span class="n">05 STORE</span><b>SQLite + FTS5 + Chroma</b><p>관찰과 요약을 저장하고 키워드·의미 검색용으로 색인합니다.</p><div class="ref">ResponseProcessor.ts:1138, 1545</div></div>
+</div>
+
+<h2>2. 훅 이벤트 — 세션 한 번의 흐름</h2>
+<div class="lanes">
+  <div class="lh">세션 시작</div><div><span class="ev a">SessionStart · start (async)</span> worker 기동 <span class="ev">SessionStart · context</span> 맥락 주입 <span class="ev">SessionStart · ensure-launcher</span> 실행 파일 점검</div>
+  <div class="lh">사용자 입력</div><div><span class="ev">UserPromptSubmit · session-init</span> 세션 행 생성과 프롬프트 저장</div>
+  <div class="lh">도구 실행 전</div><div><span class="ev">PreToolUse · file-context</span> Read·Bash·Grep·Glob·memory_search 전에 관련 파일의 과거 관찰을 붙여 줍니다.</div>
+  <div class="lh">도구 실행 후</div><div><span class="ev a">PostToolUse · observation (async)</span> <span class="ev a">PostToolUseFailure · observation (async)</span> 이벤트를 spool에 기록 → 관찰 생성</div>
+  <div class="lh">응답 종료</div><div><span class="ev a">Stop · summarize (async)</span> 세션 요약 생성 <span class="ev a">SubagentStop (async)</span></div>
+  <div class="lh">세션 종료</div><div><span class="ev a">SessionEnd · session-end (async)</span> 정리</div>
+</div>
+<p class="ref">핸들러 연결: src/cli/handlers/index.ts:8-22 · 초록 = 비동기(세션을 막지 않음)</p>
+
+<h2>3. 쓰기 경로 자세히</h2>
+<div class="loop">
+  <div class="box">
+    <h3>관찰 1건이 만들어지기까지</h3>
+    <ol class="flow">
+      <li>PostToolUse 훅 → <code>observationHandler</code>가 이벤트를 <code>&lt;data&gt;/state/hook-spool</code>에 씁니다. <span class="ref">observation.ts:30-34,148</span></li>
+      <li>원격 worker를 쓰면 <code>/api/spool/ingest</code>로 보내고, 로컬이면 drain이 가져갑니다. <span class="ref">HookSpoolRoutes.ts:23</span></li>
+      <li>원문 도구 입출력은 <code>tool_uses</code>에 저장합니다. <b>필드당 64KB에서 잘립니다.</b> <span class="ref">tool-uses.ts:35,240-241</span></li>
+      <li>프롬프트를 조립합니다(init·observation·summary 3종, 모드 템플릿 <code>plugin/modes/*.json</code>). 필드당 16,000자까지 넣고, 넘으면 앞 60%와 끝을 남깁니다. <span class="ref">src/sdk/prompts.ts:121,185,400,477</span></li>
+      <li>기본 provider는 <code>claude</code>, model은 <code>haiku</code>입니다. <span class="ref">SettingsDefaultsManager.ts:551,587</span></li>
+      <li>응답을 파싱해 <code>observations</code>에 저장하고 Chroma에 동기화합니다. FTS5는 SQLite 안에서 색인합니다. <span class="ref">ResponseProcessor.ts:1138 · SessionSearch.ts:286</span></li>
+    </ol>
+  </div>
+  <div class="box">
+    <h3>저장되는 것과 저장되지 않는 것</h3>
+    <table>
+      <tr><th>테이블</th><th>내용</th></tr>
+      <tr><td><code>sdk_sessions</code></td><td>세션 메타. <code>project TEXT NOT NULL</code></td></tr>
+      <tr><td><code>user_prompts</code></td><td>사용자 프롬프트 원문</td></tr>
+      <tr><td><code>tool_uses</code></td><td>도구 입출력 원문(64KB 상한)</td></tr>
+      <tr><td><code>observations</code></td><td>AI 압축 관찰. 검색과 주입의 중심</td></tr>
+      <tr><td><code>session_summaries</code></td><td>Stop 시점 요약</td></tr>
+    </table>
+    <p class="ref">SessionStore.ts:1310-1360, 1734 · tool-uses.ts:160</p>
+    <div class="warnbox"><b>원문 JSONL 자체는 정본으로 보관하지 않습니다.</b> transcript watcher가 바이트 오프셋으로 따라 읽기만 합니다(<code>src/services/transcripts/watcher.ts:19-20</code>). 줄 번호로 원문을 찾는 기능은 없습니다.</div>
+  </div>
+</div>
+
+<h2>4. 읽기 경로 — 주입과 검색</h2>
+<div class="loop">
+  <div class="box">
+    <h3>SessionStart 맥락 주입</h3>
+    <ol class="flow">
+      <li><code>context.ts:670</code>이 <code>/api/context/inject</code>를 호출합니다. <span class="ref">SearchRoutes.ts:245</span></li>
+      <li>같은 프로젝트의 관찰을 <code>ORDER BY created_at_epoch DESC LIMIT n</code>으로 가져옵니다. 기본 n=50입니다. <span class="ref">ObservationCompiler.ts:76-77 · Settings…:552</span></li>
+      <li>요약도 같은 방식으로 가져와 타임라인을 만듭니다. <span class="ref">ObservationCompiler.ts:256, 399</span></li>
+      <li>formatters·sections가 렌더링하고 <code>ContextBudget</code>이 토큰 예산을 맞춥니다. (세부 형식은 추정)</li>
+    </ol>
+    <p style="font-size:13px;color:var(--mut)">→ 선택 기준은 <b>관련도가 아니라 최근순</b>이고, 범위는 <b>프로젝트(경로나 git origin)</b>입니다.</p>
+  </div>
+  <div class="box">
+    <h3>MCP 검색 3단계</h3>
+    <ol class="flow">
+      <li><code>search</code> → <code>/api/search</code>: 인덱스(ID·제목) 목록 <span class="ref">mcp-server.ts:637,675</span></li>
+      <li><code>timeline</code> → <code>/api/timeline</code>: 기준 관찰 앞뒤 맥락 <span class="ref">mcp-server.ts:705</span></li>
+      <li><code>get_observations</code> → <code>/api/observations/batch</code>: 고른 것만 본문 조회 <span class="ref">mcp-server.ts:733</span></li>
+      <li><code>SearchManager</code>가 chroma·fts·hybrid·filter_only 중 전략을 고르고, Chroma가 실패하면 FTS5로 대체합니다. <span class="ref">SearchManager.ts:50-52,104-107,168</span></li>
+    </ol>
+  </div>
+</div>
+
+<h2>5. 두 가지 런타임</h2>
+<table>
+  <tr><th></th><th>legacy worker (기본값, 지금 이 Mac에서 실행 중)</th><th>server-beta (docker-compose)</th></tr>
+  <tr><td>선택</td><td><code>CLAUDE_MEM_RUNTIME=worker</code> <span class="ref">Settings…:854</span></td><td><code>CLAUDE_MEM_RUNTIME=server-beta</code></td></tr>
+  <tr><td>저장소</td><td>SQLite(WAL) + FTS5 + Chroma(uvx chroma-mcp)</td><td>Postgres 17 + BM25 + tsvector(영어) + pgvector HNSW</td></tr>
+  <tr><td>생성</td><td>worker 프로세스 안에서 처리</td><td>Valkey + BullMQ worker. 수평 확장 가능</td></tr>
+  <tr><td>사용 단위</td><td>개인 1명, 프로젝트 단위</td><td><code>teams</code>·<code>projects</code>·<code>team_members</code>·<code>api_keys</code>·<code>audit_log</code></td></tr>
+  <tr><td>인증</td><td>loopback</td><td><code>api-key</code>(기본) / <code>local-dev</code>. <b>두 모드 모두 <code>userId: null</code></b> <span class="ref">postgres-auth.ts:91,131</span></td></tr>
+  <tr><td>세션 소속</td><td><code>project NOT NULL</code></td><td><code>project_id</code>·<code>team_id</code> NOT NULL FK <span class="ref">postgres/schema.ts:322-323</span></td></tr>
+</table>
+
+<h2>6. 이 Mac의 실제 상태 (실측)</h2>
+<table>
+  <tr><th>항목</th><th>값</th><th>근거</th></tr>
+  <tr><td>worker 프로세스</td><td>bun, <code>127.0.0.1:37777</code> 대기 중</td><td>lsof</td></tr>
+  <tr><td>포트</td><td>기본 계산값은 37700+uid%100 = 37701이지만 settings에서 37777로 지정됨</td><td>install-port.ts:7 · ~/.claude-mem/settings.json</td></tr>
+  <tr><td>provider / model</td><td><code>codex</code> / <code>sonnet</code> (기본값 claude/haiku를 바꿔 둠)</td><td>settings.json</td></tr>
+  <tr><td>데이터 디렉터리</td><td><code>~/.claude-mem/</code> — claude-mem.db, chroma/, logs/, corpora/, backups/, state/hook-spool</td><td>data-dir.ts:20-24 · paths.ts</td></tr>
+  <tr><td>프로세스 관리</td><td>SessionStart 훅이 띄움(launchd 아님). supervisor가 상태 점검과 고아 Chroma 정리를 맡음</td><td>src/supervisor/</td></tr>
+</table>
+
+<h2>7. History 계층 요구사항과의 차이</h2>
+<p class="sub">요구사항 출처: <code>ax-boaz-docs/4layer-system.md</code> 9절 Agent Session DB(일부 항목은 제안 단계).</p>
+<table>
+  <tr><th>요구</th><th>현재</th><th>상태</th><th>바꿔야 할 지점</th></tr>
+  <tr><td>R1 서버가 사내망 신원으로 사용자 ID 주입</td><td>팀 API 키뿐이고 userId는 항상 null. projectId는 클라이언트가 보냄</td><td><span class="pill gap">신규</span></td><td>인증 모드 <code>network-identity</code>(Tailscale whois → GitHub ID), 모든 테이블에 <code>user_id</code></td></tr>
+  <tr><td>R2 CRUD 속도, SQLite 우선</td><td>SQLite WAL 사용. 서버용 SQLite 스키마도 있음</td><td><span class="pill ok">있음</span></td><td>벤치마크만 하면 됨</td></tr>
+  <tr><td>R3 프로젝트에 속하지 않고 Beads와 느슨히 연결</td><td>모든 테이블에 project가 필수</td><td><span class="pill gap">신규</span></td><td>고정 "global" 프로젝트 하나 + <code>metadata</code> JSONB에 cwd·git·Beads ID 신호. ID 추출기 신규</td></tr>
+  <tr><td>R4 공개 기본·비공개 지정·전파 차단</td><td>본문의 <code>&lt;private&gt;</code> 태그 제거뿐</td><td><span class="pill gap">신규</span></td><td><code>visibility</code> 컬럼, 비공개를 읽으면 자동 승격, wiki-update용 public 전용 조회 경로</td></tr>
+  <tr><td>R5 허용 목록 수집</td><td>차단 목록(<code>CLAUDE_MEM_EXCLUDED_PROJECTS</code>)만 있음</td><td><span class="pill part">일부</span></td><td><code>should-track-project.ts</code>에 허용 목록 분기 + 서버에서 재검사</td></tr>
+  <tr><td>R6 원문 JSONL을 자르지 않고 줄 단위로 보관</td><td>64KB·16k 상한이 있고 줄 주소 없음. watcher는 있음</td><td><span class="pill gap">신규</span></td><td><code>transcript_lines(session_id, line_no, raw)</code> + <code>/claude-sessions/&lt;id&gt;.jsonl</code> 원문 제공</td></tr>
+  <tr><td>R7 개인 claude-mem과 공존</td><td>데이터 디렉터리·포트·<code>claude-mem</code> 실행 명령·플러그인 이름·MCP 이름이 겹침</td><td><span class="pill part">조치 필요</span></td><td>개발 중에는 플러그인으로 설치하지 않고 <code>CLAUDE_MEM_DATA_DIR</code>와 포트를 분리해 별도 프로세스로 실행. <code>npm run dev</code> 금지(설치된 플러그인을 건드림)</td></tr>
+</table>
+
+<h2>8. 포크 운영 시 주의</h2>
+<div class="loop">
+  <div class="box">
+    <h3>upstream 변경 속도</h3>
+    <p>최근 30일 upstream/main <b>1,253커밋(하루 약 42개)</b>. 변경이 많은 곳은 <code>src/ui/my-work</code>, <code>plugin/ui/work-view</code>, <code>src/services/worker</code>, <code>src/services/sqlite</code>입니다.</p>
+    <p>→ 우리 코드는 <code>src/agent-session-db/</code> 같은 새 디렉터리에 모으고, 기존 파일은 인증 미들웨어·스키마 마이그레이션·should-track 세 곳만 건드리는 편이 동기화에 유리합니다.</p>
+  </div>
+  <div class="box">
+    <h3>제안: 첫 마일스톤 (확정 아님)</h3>
+    <p>허용 목록 폴더의 Claude Code·Codex JSONL을 <b>자르지 않고 줄 단위로</b> SQLite WAL 서버에 올리고, 서버가 Tailscale 신원으로 <code>user_id</code>를 넣습니다. <code>/claude-sessions/&lt;id&gt;.jsonl</code>을 원문 그대로 돌려줍니다. AI 압축은 그다음 단계로 둡니다.</p>
+  </div>
+</div>
+
+<footer>작성: Claude Code · Beads <code>ax-boaz-qjbn</code> · 이 문서는 조사 기록이며 설계 결정이 아닙니다. 구현 범위와 DB 엔진 같은 남은 결정은 4layer-system.md 9절을 따릅니다.</footer>
+</main>
+</body>
+</html>
